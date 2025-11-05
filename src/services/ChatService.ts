@@ -256,12 +256,14 @@ When you call a tool, format it as JSON: {"name": "web_search", "arguments": {"q
    * @param messages - Existing conversation history
    * @param userMessage - The new user message to send
    * @param onUpdate - Callback function called for each streaming update
+   * @param existingAssistantMessageId - Optional: ID of existing assistant message to append to (for continuations)
    * @returns Promise that resolves when streaming is complete
    */
   async sendMessage(
     messages: Message[],
     userMessage: Message,
-    onUpdate: StreamCallback
+    onUpdate: StreamCallback,
+    existingAssistantMessageId?: string
   ): Promise<void> {
     const startTime = Date.now()
     let totalTokens = 0
@@ -269,13 +271,17 @@ When you call a tool, format it as JSON: {"name": "web_search", "arguments": {"q
     let promptTokens = 0
     let accumulatedThinking = ''
     let buffer = ''
+    let accumulatedContent = '' // Track accumulated content to handle incremental chunks
 
-    // Create assistant message placeholder
-    const assistantMessageId = (Date.now() + 1).toString()
+    // Create assistant message placeholder - reuse existing ID if provided (for continuations)
+    const assistantMessageId = existingAssistantMessageId || (Date.now() + 1).toString()
+    const existingContent = existingAssistantMessageId ? messages.find(m => m.id === existingAssistantMessageId)?.content || '' : ''
+    accumulatedContent = existingContent
+    
     const assistantMessage: Message = {
       id: assistantMessageId,
       role: 'assistant',
-      content: '',
+      content: existingContent,
       isStreaming: true,
       duration: 0,
     }
@@ -298,10 +304,13 @@ When you call a tool, format it as JSON: {"name": "web_search", "arguments": {"q
         .filter(msg => msg.content.trim() || msg.toolCalls)
         .map(msg => {
           if (msg.toolCalls && msg.toolCalls.length > 0) {
-            // Format message with tool calls
+            // Format message with tool calls - include thinking if available
+            const messageContent = msg.thinking 
+              ? `${msg.thinking}\n\n${msg.content}`.trim()
+              : msg.content
             return {
               role: msg.role,
-              content: msg.content,
+              content: messageContent,
               tool_calls: msg.toolCalls.map(tc => ({
                 id: tc.id,
                 type: tc.type,
@@ -317,6 +326,13 @@ When you call a tool, format it as JSON: {"name": "web_search", "arguments": {"q
               name: msg.toolResults?.[0]?.name
             }
           }
+          // Include thinking in assistant messages if available
+          if (msg.role === 'assistant' && msg.thinking) {
+            return {
+              role: msg.role,
+              content: `${msg.thinking}\n\n${msg.content}`.trim()
+            }
+          }
           return {
             role: msg.role,
             content: msg.content
@@ -325,11 +341,13 @@ When you call a tool, format it as JSON: {"name": "web_search", "arguments": {"q
       
       apiMessages.push(...conversationMessages)
       
-      // Add current user message
-      apiMessages.push({
-        role: 'user',
-        content: userMessage.content
-      })
+      // Add current user message (skip if empty for continuation)
+      if (userMessage.content.trim()) {
+        apiMessages.push({
+          role: 'user',
+          content: userMessage.content
+        })
+      }
       
       // Prepare tools definition if web search is enabled
       const tools = this.config.webSearchEnabled ? [{
@@ -409,14 +427,27 @@ When you call a tool, format it as JSON: {"name": "web_search", "arguments": {"q
             const toolCalls = json.message?.tool_calls || []
             
             if (messageContent) {
-              // Get current message content and append the new chunk
-              const currentContent = assistantMessage.content || ''
+              // Ollama chat API can send either cumulative or incremental content
+              // We need to detect which and accumulate accordingly
+              const currentContent = accumulatedContent
               
-              // Check if chunk is cumulative or incremental
-              const isCumulative = currentContent && 
-                messageContent.length > currentContent.length && 
-                messageContent.includes(currentContent)
-              const rawContent = isCumulative ? messageContent : currentContent + messageContent
+              // Check if this is cumulative (contains all previous content) or incremental (just new chunk)
+              // Cumulative: messageContent is longer and starts with currentContent
+              // Incremental: messageContent is shorter or doesn't start with currentContent
+              let rawContent: string
+              if (currentContent && messageContent.length >= currentContent.length && messageContent.startsWith(currentContent)) {
+                // Cumulative - use it directly
+                rawContent = messageContent
+                accumulatedContent = messageContent
+              } else if (currentContent && messageContent.length < currentContent.length) {
+                // Likely incremental - append
+                rawContent = currentContent + messageContent
+                accumulatedContent = rawContent
+              } else {
+                // New content or unclear - use as cumulative
+                rawContent = messageContent
+                accumulatedContent = messageContent
+              }
               
               // Extract thinking from the accumulated content
               const { cleanText, thinking } = this.extractThinking(rawContent)
@@ -543,7 +574,8 @@ When you call a tool, format it as JSON: {"name": "web_search", "arguments": {"q
                   isDone: false
                 })
                 
-                // Continue conversation with tool results - include tool results in history
+                // Continue conversation with tool results
+                // Include the original user message, assistant message with thinking, and tool results
                 const toolMessages: Message[] = toolResults.map(tr => ({
                   id: `tool_${tr.toolCallId}`,
                   role: 'tool',
@@ -551,12 +583,24 @@ When you call a tool, format it as JSON: {"name": "web_search", "arguments": {"q
                   toolResults: [tr]
                 }))
                 
-                const continuationMessages = [...messages, userMessage, assistantMessage, ...toolMessages]
+                // Build continuation messages: original messages + user message + assistant message (with thinking) + tool results
+                const continuationMessages = [
+                  ...messages.filter(m => m.role !== 'tool'), // Exclude any previous tool messages
+                  userMessage, // Original user question
+                  {
+                    ...assistantMessage,
+                    content: assistantMessage.content || '', // Keep any existing content
+                    thinking: assistantMessage.thinking || accumulatedThinking // Include thinking data
+                  },
+                  ...toolMessages // Tool results
+                ]
+                
+                // Continue with empty user message since everything is already in continuationMessages
                 await this.sendMessage(continuationMessages, {
                   id: 'continuation',
                   role: 'user',
-                  content: '' // Empty user message to continue
-                }, onUpdate)
+                  content: ''
+                }, onUpdate, assistantMessageId)
                 
                 return
               }
@@ -605,15 +649,27 @@ When you call a tool, format it as JSON: {"name": "web_search", "arguments": {"q
           const thinkingContent = json.message?.thinking || json.thinking || ''
           
           if (messageContent) {
-            const currentContent = assistantMessage.content || ''
-            const newContent = currentContent + messageContent
+            const currentContent = accumulatedContent
+            // Check if cumulative or incremental
+            let rawContent: string
+            if (currentContent && messageContent.length >= currentContent.length && messageContent.startsWith(currentContent)) {
+              rawContent = messageContent
+              accumulatedContent = messageContent
+            } else if (currentContent && messageContent.length < currentContent.length) {
+              rawContent = currentContent + messageContent
+              accumulatedContent = rawContent
+            } else {
+              rawContent = messageContent
+              accumulatedContent = messageContent
+            }
             
-            const { thinking } = this.extractThinking(newContent)
+            const { thinking } = this.extractThinking(rawContent)
             if (thinking) {
               accumulatedThinking = thinking
             }
             
-            assistantMessage.content = newContent
+            assistantMessage.content = this.removeToolCalls(rawContent)
+            accumulatedContent = rawContent
           }
           
           if (thinkingContent) {
@@ -625,7 +681,7 @@ When you call a tool, format it as JSON: {"name": "web_search", "arguments": {"q
       }
 
       // Final update to ensure we have all accumulated content
-      const currentContent = assistantMessage.content || ''
+      const currentContent = accumulatedContent || assistantMessage.content || ''
       const finalExtraction = this.extractThinking(currentContent)
       let finalContent = this.removeToolCalls(finalExtraction.cleanText)
       finalContent = this.cleanTrailingPunctuation(finalContent)
@@ -668,7 +724,8 @@ When you call a tool, format it as JSON: {"name": "web_search", "arguments": {"q
           isDone: false
         })
         
-        // Continue conversation with tool results - include tool results in history
+        // Continue conversation with tool results
+        // Include the original user message, assistant message with thinking, and tool results
         const toolMessages: Message[] = toolResults.map(tr => ({
           id: `tool_${tr.toolCallId}`,
           role: 'tool',
@@ -676,12 +733,24 @@ When you call a tool, format it as JSON: {"name": "web_search", "arguments": {"q
           toolResults: [tr]
         }))
         
-        const continuationMessages = [...messages, userMessage, assistantMessage, ...toolMessages]
+        // Build continuation messages: original messages + user message + assistant message (with thinking) + tool results
+        const continuationMessages = [
+          ...messages.filter(m => m.role !== 'tool'), // Exclude any previous tool messages
+          userMessage, // Original user question
+          {
+            ...assistantMessage,
+            content: assistantMessage.content || '', // Keep any existing content
+            thinking: assistantMessage.thinking || accumulatedThinking // Include thinking data
+          },
+          ...toolMessages // Tool results
+        ]
+        
+        // Continue with empty user message since everything is already in continuationMessages
         await this.sendMessage(continuationMessages, {
           id: 'continuation',
           role: 'user',
-          content: '' // Empty user message to continue
-        }, onUpdate)
+          content: ''
+        }, onUpdate, assistantMessageId)
         
         return
       }
